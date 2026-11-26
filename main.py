@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 import requests
 
-BOT_TOKEN = "PASTE_YOUR_NEW_TOKEN_HERE"
+BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
 
 SYMBOL = "BTCUSDT"
@@ -147,31 +147,34 @@ def log_trades(trades: List[dict]) -> None:
         )
 
 
+def fmt_usd(x: float) -> str:
+    return f"${x:,.0f}" if x >= 100 else f"${x:,.2f}"
+
+
 def build_trade_report(trades: List[dict]) -> str:
-    qtys = [float(t["q"]) for t in trades]
-    n = len(qtys)
+    usd = [float(t["q"]) * float(t["p"]) for t in trades]  # trade size in $
+    n = len(usd)
     if n == 0:
         return ""
-    s = sorted(qtys)
-    total = sum(s)
-    if total <= 0:
+    total_usd = sum(usd)
+    total_btc = sum(float(t["q"]) for t in trades)
+    if total_usd <= 0:
         return ""
 
+    s = sorted(usd)
     # 75th percentile (nearest-rank → an actual trade size)
     p75 = s[max(0, math.ceil(0.75 * n) - 1)]
 
-    in_range = [q for q in s if q <= p75]
-    out_range = [q for q in s if q > p75]
-    range_vol = sum(in_range)
-    out_vol = sum(out_range)
+    low_vol = sum(u for u in s if u <= p75)   # lowest trade → 75th percentile
+    high_vol = sum(u for u in s if u > p75)   # above 75th percentile
 
     return (
-        f"\nTrades: {n} · Total: {total:.3f}\n"
-        f"Range: {s[0]:.3f} → {p75:.3f} (min → P75)\n"
-        f"Max in range: {max(in_range):.3f}\n"
-        f"Range vol: {range_vol:.3f} · {range_vol / total * 100:.2f}%\n"
-        f"Right side (>P75): {out_vol:.3f} · {out_vol / total * 100:.2f}%\n"
-        f"Max trade (candle): {s[-1]:.3f}"
+        f"\nTrades: {n:,}\n"
+        f"Volume: {total_btc:,.3f} BTC · {fmt_usd(total_usd)}\n"
+        f"Biggest trade: {fmt_usd(s[-1])}\n"
+        f"Range (lowest → 75th): {fmt_usd(s[0])} – {fmt_usd(p75)}\n"
+        f"Range contributed: {low_vol / total_usd * 100:.2f}%\n"
+        f"Above 75th contributed: {high_vol / total_usd * 100:.2f}%"
     )
 
 
