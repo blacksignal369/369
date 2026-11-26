@@ -151,15 +151,16 @@ def fmt_usd(x: float) -> str:
     return f"${x:,.0f}" if x >= 100 else f"${x:,.2f}"
 
 
-def build_trade_report(trades: List[dict]) -> str:
+def build_trade_report(trades: List[dict]):
+    """Returns (alert_text, range_beats_above) or None."""
     usd = [float(t["q"]) * float(t["p"]) for t in trades]  # trade size in $
     n = len(usd)
     if n == 0:
-        return ""
+        return None
     total_usd = sum(usd)
     total_btc = sum(float(t["q"]) for t in trades)
     if total_usd <= 0:
-        return ""
+        return None
 
     s = sorted(usd)
     # 75th percentile (nearest-rank → an actual trade size)
@@ -168,7 +169,7 @@ def build_trade_report(trades: List[dict]) -> str:
     low_vol = sum(u for u in s if u <= p75)   # lowest trade → 75th percentile
     high_vol = sum(u for u in s if u > p75)   # above 75th percentile
 
-    return (
+    text = (
         f"\nTrades: {n:,}\n"
         f"Volume: {total_btc:,.3f} BTC · {fmt_usd(total_usd)}\n"
         f"Biggest trade: {fmt_usd(s[-1])}\n"
@@ -176,6 +177,7 @@ def build_trade_report(trades: List[dict]) -> str:
         f"Range contributed: {low_vol / total_usd * 100:.2f}%\n"
         f"Above 75th contributed: {high_vol / total_usd * 100:.2f}%"
     )
+    return text, low_vol > high_vol
 
 
 def check_interval(interval: str) -> None:
@@ -210,17 +212,27 @@ def check_interval(interval: str) -> None:
         return
 
     # alert candle → pull every trade, log it, build distribution
-    extra = ""
+    report = None
     try:
         trades = fetch_candle_trades(open_t, PERIOD_SEC[interval] * 1000)
         if trades:
             if LOG_EACH_TRADE:
                 log_trades(trades)
-            extra = build_trade_report(trades)
+            report = build_trade_report(trades)
         else:
             print(f"[WARN] no trades fetched for {interval} candle {open_t}")
     except Exception:
         traceback.print_exc()
+
+    if report is None:
+        print(f"[HOLD] no trade data — retry {interval}")
+        return
+
+    extra, range_wins = report
+    if not range_wins:
+        last_processed_ms[interval] = open_t
+        print(f"[SKIP] {interval} {va}% — 0-75th did not beat above 75th")
+        return
 
     msg = f"{'🟢' if c > o else '🔴'} {interval} · {va}%{extra}"
     if send_tg(msg):
