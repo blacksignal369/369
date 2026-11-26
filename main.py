@@ -1,12 +1,13 @@
-
 #!/usr/bin/env python3
 """
 Binance USDⓈ-M — BTCUSDT PVSRA (TradingView exact, volume only)
-1m (toggle) + 1h + 1d · 150% / 200% · no taker
+1m only · 150% / 200% · no taker
++ trade-size distribution of the alert candle (appended to the alert)
 """
 
 from __future__ import annotations
 
+import math
 import time
 import traceback
 from datetime import datetime, timezone, timedelta
@@ -14,11 +15,12 @@ from typing import Dict, List, Optional
 
 import requests
 
-BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
+BOT_TOKEN = "PASTE_YOUR_NEW_TOKEN_HERE"
 CHAT_ID = "6263967739"
 
 SYMBOL = "BTCUSDT"
-ENABLE_1M = False
+ENABLE_1M = True
+LOG_EACH_TRADE = True  # prints every trade of the alert candle to the console
 
 LOOKBACK = 10
 HEARTBEAT_SEC = 15 * 60
@@ -28,17 +30,13 @@ BINANCE_RETRIES = 4
 JEDDAH = timezone(timedelta(hours=3))
 
 FAPI = "https://fapi.binance.com"
-PERIOD_SEC = {"1m": 60, "1h": 3600, "1d": 86400}
+PERIOD_SEC = {"1m": 60}
 
 last_processed_ms: Dict[str, int] = {}
 
 
 def active_intervals() -> List[str]:
-    out = []
-    if ENABLE_1M:
-        out.append("1m")
-    out.extend(["1h", "1d"])
-    return out
+    return ["1m"] if ENABLE_1M else []
 
 
 def jeddah_str(ms: Optional[int] = None) -> str:
@@ -108,6 +106,75 @@ def pvsra_va(volumes: List[float], highs: List[float], lows: List[float]) -> int
     return 0
 
 
+# ───────────── trade distribution of the alert candle ─────────────
+
+def fetch_candle_trades(open_ms: int, period_ms: int) -> Optional[List[dict]]:
+    """All aggTrades inside [open_ms, open_ms + period_ms - 1]."""
+    end_ms = open_ms + period_ms - 1
+    trades: List[dict] = []
+    data = get_json(
+        "/fapi/v1/aggTrades",
+        {"symbol": SYMBOL, "startTime": open_ms, "endTime": end_ms, "limit": 1000},
+    )
+    while True:
+        if not isinstance(data, list):
+            return None
+        if not data:
+            break
+        finished = False
+        for t in data:
+            if int(t["T"]) > end_ms:
+                finished = True
+                break
+            trades.append(t)
+        if finished or len(data) < 1000:
+            break
+        data = get_json(
+            "/fapi/v1/aggTrades",
+            {"symbol": SYMBOL, "fromId": int(data[-1]["a"]) + 1, "limit": 1000},
+        )
+    return trades
+
+
+def log_trades(trades: List[dict]) -> None:
+    for t in trades:
+        ms = int(t["T"])
+        dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).astimezone(JEDDAH)
+        side = "SELL" if t["m"] else "BUY"  # m = buyer is maker → taker sold
+        print(
+            f"[TRADE] {dt.strftime('%H:%M:%S')}.{ms % 1000:03d} "
+            f"id={t['a']} {side} qty={t['q']} price={t['p']}"
+        )
+
+
+def build_trade_report(trades: List[dict]) -> str:
+    qtys = [float(t["q"]) for t in trades]
+    n = len(qtys)
+    if n == 0:
+        return ""
+    s = sorted(qtys)
+    total = sum(s)
+    if total <= 0:
+        return ""
+
+    # 75th percentile (nearest-rank → an actual trade size)
+    p75 = s[max(0, math.ceil(0.75 * n) - 1)]
+
+    in_range = [q for q in s if q <= p75]
+    out_range = [q for q in s if q > p75]
+    range_vol = sum(in_range)
+    out_vol = sum(out_range)
+
+    return (
+        f"\nTrades: {n} · Total: {total:.3f}\n"
+        f"Range: {s[0]:.3f} → {p75:.3f} (min → P75)\n"
+        f"Max in range: {max(in_range):.3f}\n"
+        f"Range vol: {range_vol:.3f} · {range_vol / total * 100:.2f}%\n"
+        f"Right side (>P75): {out_vol:.3f} · {out_vol / total * 100:.2f}%\n"
+        f"Max trade (candle): {s[-1]:.3f}"
+    )
+
+
 def check_interval(interval: str) -> None:
     data = get_json(
         "/fapi/v1/klines",
@@ -139,7 +206,20 @@ def check_interval(interval: str) -> None:
         last_processed_ms[interval] = open_t
         return
 
-    msg = f"{'🟢' if c > o else '🔴'} {interval} · {va}%"
+    # alert candle → pull every trade, log it, build distribution
+    extra = ""
+    try:
+        trades = fetch_candle_trades(open_t, PERIOD_SEC[interval] * 1000)
+        if trades:
+            if LOG_EACH_TRADE:
+                log_trades(trades)
+            extra = build_trade_report(trades)
+        else:
+            print(f"[WARN] no trades fetched for {interval} candle {open_t}")
+    except Exception:
+        traceback.print_exc()
+
+    msg = f"{'🟢' if c > o else '🔴'} {interval} · {va}%{extra}"
     if send_tg(msg):
         last_processed_ms[interval] = open_t
         print(f"[ALERT] {msg}")
@@ -153,7 +233,7 @@ def near_close_window(interval: str, now: float) -> bool:
 
 
 def startup() -> bool:
-    data = get_json("/fapi/v1/klines", {"symbol": SYMBOL, "interval": "1h", "limit": 3})
+    data = get_json("/fapi/v1/klines", {"symbol": SYMBOL, "interval": "1m", "limit": 3})
     if not isinstance(data, list) or len(data) < 2:
         send_tg(f"❌ STARTUP FAILED\n{SYMBOL}")
         return False
